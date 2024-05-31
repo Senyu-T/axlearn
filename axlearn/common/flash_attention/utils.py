@@ -2,6 +2,7 @@
 
 """FlashAttention utilities shared amongst CPU/GPU/TPU backends."""
 import functools
+import os
 from typing import Callable, Literal, Optional
 
 import jax
@@ -99,20 +100,59 @@ def flash_attention_implementation(
         NotImplementedError: If implementation for the backend is not available.
     """
     if backend == "gpu":
-        # Lazy import GPU flash-attention to avoid file-level dependency on jax-triton.
-        # pylint: disable-next=import-outside-toplevel
-        from axlearn.common.flash_attention.gpu_attention import (
-            flash_attention as gpu_flash_attention,
-        )
+        user_triton_kernel = "NVTE_FUSED_ATTN" not in os.environ
+        if not user_triton_kernel:
+            try:
+                # pytype: disable=import-error
+                # pylint: disable-next=import-outside-toplevel
+                from transformer_engine.jax.fused_attn import AttnBiasType, AttnMaskType, fused_attn
 
-        # shard_map-decorated function needs to be jitted.
-        @jax.jit
-        def jit_attn(query, key, value, bias):
-            return gpu_flash_attention(
-                query, key, value, bias=bias, causal=causal, softmax_scale=softmax_scale
+                def te_attn(query, key, value, bias):
+                    attn_bias_type = AttnBiasType.NO_BIAS if bias is None \
+                        else AttnBiasType.POST_SCALE_BIAS
+                    # Currently we do not accept Padding Mask or Padding Causal Mask
+                    attn_mask_type = AttnMaskType.CAUSAL_MASK if causal else AttnMaskType.NO_MASK
+                    return fused_attn(
+                        query,
+                        key,
+                        value,
+                        bias=bias,
+                        mask=None,
+                        seed=None,
+                        attn_mask_type=attn_mask_type,
+                        attn_bias_type=attn_bias_type,
+                        scaling_factor=softmax_scale,
+                        dropout_probability=0.0,
+                        is_training=True,  # TODO(kelvin-zou): set to False for inference.
+                    )
+
+                logging.info("Using TE flash-attention implementation.")
+                return te_attn
+
+            except ModuleNotFoundError:
+                logging.warning("TE flash-attention implementation not found.")
+                user_triton_kernel = True
+                # Unset the environment variable to fall back to Triton.
+                os.environ.pop("NVTE_FUSED_ATTN")
+
+        if user_triton_kernel:
+            # Lazy import GPU flash-attention to avoid file-level dependency on jax-triton.
+            # Fall back to triton based flash attention.
+            # pylint: disable-next=import-outside-toplevel
+            from axlearn.common.flash_attention.gpu_attention import (
+                flash_attention as gpu_flash_attention,
             )
 
-        return jit_attn
+            logging.info("Using Triton flash-attention implementation.")
+
+            # shard_map-decorated function needs to be jitted.
+            @jax.jit
+            def triton_attn(query, key, value, bias):
+                return gpu_flash_attention(
+                    query, key, value, bias=bias, causal=causal, softmax_scale=softmax_scale
+                )
+
+        return triton_attn
 
     elif backend == "tpu":
         # TODO(tom_gunter): See if we can do better block-size tuning.
